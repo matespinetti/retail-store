@@ -1,0 +1,61 @@
+name: CI/CD Pipeline - Retail Store
+on:
+  push:
+    branches:
+      - main
+    # Run CI only when application or CI config changes.
+    paths:
+      - "src/catalog/**"
+      - "src/cart/**"
+      - "src/checkout/**"
+      - "src/orders/**"
+      - "src/ui/**"
+      - ".github/workflows/ci.yaml"
+
+  pull_request:
+    branches:
+      - main
+    # Keep PR validation aligned with push rules.
+    paths:
+      - "src/catalog/**"
+      - "src/cart/**"
+      - "src/checkout/**"
+      - "src/orders/**"
+      - "src/ui/**"
+      - ".github/workflows/ci.yaml"
+
+# Critical: Required for AWS OICD authetncation
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+  AWS_ACCOUNT_ID: "${{ secrets.AWS_ACCOUNT_ID }}"
+  AWS_ROLE_NAME: "${{ secrets.AWS_ROLE_NAME }}"
+  ECR_REPOSITORY: "retail-store"
+  ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+
+jobs:
+  # =====================================
+  # JOB 1: CHANGE DETECTION
+  # =====================================
+  detect-changes:
+    name: Detect Changed Microservices
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Detect Changed Microservices
+        uses: dorny/paths-filter@v3
+        id: detect
+        with:
+          filters: |
+            cart: "src/cart/**"
+            checkout: "src/checkout/**"
+            orders: "src/orders/**"
+            ui: "src/ui/**"
+            catalog: "src/catalog/**"
