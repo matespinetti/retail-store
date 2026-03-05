@@ -24,7 +24,7 @@ on:
       - "src/ui/**"
       - ".github/workflows/ci.yaml"
 
-# Critical: Required for AWS OICD authetncation
+# Critical: Required for AWS OIDC authentication
 permissions:
   id-token: write
   contents: read
@@ -32,30 +32,163 @@ permissions:
 env:
   AWS_REGION: "us-east-1"
   AWS_ACCOUNT_ID: "${{ secrets.AWS_ACCOUNT_ID }}"
-  AWS_ROLE_NAME: "${{ secrets.AWS_ROLE_NAME }}"
   ECR_REPOSITORY: "retail-store"
   ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+  GITOPS_REPO: "${{ github.repository_owner }}/retail-store-gitops"
+
 
 jobs:
   # =====================================
-  # JOB 1: CHANGE DETECTION
+  # JOB 1: CHANGE DETECTION(Matrix Generation)
   # =====================================
   detect-changes:
     name: Detect Changed Microservices
     runs-on: ubuntu-latest
     outputs:
-      services: ${{ steps.detect.outputs.services }}
+      services: ${{ steps.filter.outputs.changes}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
       - name: Detect Changed Microservices
         uses: dorny/paths-filter@v3
-        id: detect
+        id: filter
         with:
           filters: |
-            cart: "src/cart/**"
-            checkout: "src/checkout/**"
-            orders: "src/orders/**"
-            ui: "src/ui/**"
-            catalog: "src/catalog/**"
+            cart: 
+              - "src/cart/**"
+            checkout: 
+              - "src/checkout/**"
+            orders: 
+              - "src/orders/**"
+            ui: 
+              - "src/ui/**"
+            catalog: 
+              - "src/catalog/**"
+  # =====================================
+  # JOB 2: Ci/CD(Build, Cache, Push and GitOps Hand-off)
+  # =====================================
+  build-and-push:
+    name: Build and Push
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.services != '[]' && needs.detect-changes.outputs.services != ''}}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # A failure in 'cart' won't stop 'ui' from deploying
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps: 
+      #1. Setup Phase
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          path: app-repo
+      
+      - name: Set Short SHA
+        id: vars
+        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+        working-directory: app-repo
+      
+      #2. Professional Docker Setup
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true 
+      
+      #3. AWS OIDC Authentication
+      - name: Configure AWS Credentials
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/retail-dev-cicd-${{ matrix.service }}-gha-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions
+      
+      - name: Login to Amazon ECR
+        if: ${{ github.event_name != 'pull_request' }}
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      #4. Build and Push(Smart PR Detection)
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}/app-repo/src/${{ matrix.service }}
+          push: ${{ github.event_name != 'pull_request'}}
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}-${{ matrix.service }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}-${{ matrix.service }}:${{ env.SHORT_SHA }}
+          # Advanced caching to speed up builds
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+      
+      #5. GitOps Hand-off
+      - name: Checkout GitOps Repo
+        uses: actions/checkout@v6
+        if: ${{ github.event_name != 'pull_request'}}
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops-repo
+
+      - name: Install yq
+        if: ${{ github.event_name != 'pull_request'}}
+        uses: mikefarah/yq@v4.44.3
+      
+      - name: Update Helm Values & Commit
+        if: ${{ github.event_name != 'pull_request'}}
+        run: |
+          cd gitops-repo
+          SERVICE_DIR="releases/${{ matrix.service }}"
+          VALUES_FILE="${SERVICE_DIR}/values-dev.yaml"
+
+          # Validate expected GitOps structure.
+          if [[ ! -d "${SERVICE_DIR}" ]]; then
+            echo "Missing service directory: ${SERVICE_DIR}"
+            exit 1
+          fi
+
+          if [[ ! -f "${VALUES_FILE}" ]]; then
+            echo "Missing values file: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          # Update only image.tag in the service dev overlay.
+          yq -i '.image.tag = "${{ env.SHORT_SHA }}"' "${VALUES_FILE}"
+          
+          # Professional Commit Formatting 
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${VALUES_FILE}"
+
+          # Idempotent push: only push if there is a diff
+          if git diff --cached --quiet; then
+            echo "No changes detected. Skipping Git commit."
+          else
+            git commit -m "deploy(${{ matrix.service }}): update image to ${{ env.SHORT_SHA }}" -m "Triggered by commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
+
+            # Matrix jobs can race when pushing to the same branch; retry with rebase.
+            for attempt in 1 2 3; do
+              if git push origin main; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "Push failed after 3 attempts."
+                exit 1
+              fi
+              git pull --rebase origin main
+            done
+          fi
+      - name: CI Complete
+        run: echo "CI/CD pipeline completed successfully for ${{ matrix.service }}"
+
+        
+          
+      
+      
+      
