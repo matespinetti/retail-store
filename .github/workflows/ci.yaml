@@ -144,15 +144,9 @@ jobs:
         if: ${{ github.event_name != 'pull_request'}}
         run: |
           cd gitops-repo
-          SERVICE_DIR="releases/${{ matrix.service }}"
-          VALUES_FILE="${SERVICE_DIR}/values-dev.yaml"
+          VALUES_FILE="helm/environments/dev/${{ matrix.service }}.yaml"
 
           # Validate expected GitOps structure.
-          if [[ ! -d "${SERVICE_DIR}" ]]; then
-            echo "Missing service directory: ${SERVICE_DIR}"
-            exit 1
-          fi
-
           if [[ ! -f "${VALUES_FILE}" ]]; then
             echo "Missing values file: ${VALUES_FILE}"
             exit 1
